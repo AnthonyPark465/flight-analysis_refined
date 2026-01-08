@@ -23,7 +23,6 @@ history.json
 *.sqlite
 *.sqlite3
 
-*.pt
 *.pth
 *.onnx
 

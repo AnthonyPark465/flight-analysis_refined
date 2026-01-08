@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -14,7 +14,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8501
-ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
-ENV STREAMLIT_SERVER_PORT=${PORT}
 
-CMD ["bash", "-lc", "streamlit run app.py --server.address=0.0.0.0 --server.port=$PORT"]
+CMD ["bash", "-lc", "streamlit run app.py --server.address=0.0.0.0 --server.port=8501"]

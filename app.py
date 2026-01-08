@@ -1,12 +1,13 @@
 import os
 import base64
 import datetime
-import sqlite3
 from pathlib import Path
 
 import streamlit as st
 from ultralytics import YOLO
 import plotly.graph_objects as go
+
+from supabase import create_client
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,58 +38,98 @@ RES_DIR = _pick_persist_dir()
 LOGO_PATH = BASE_DIR / "flightdata-logo.svg"
 MISSION_PATH = BASE_DIR / "mission.png"
 WEIGHTS_PATH = Path(os.getenv("MODEL_PATH", str(BASE_DIR / "250921_best.pt")))
-DB_PATH = RES_DIR / "history.db"
 
 PAGES = ["About", "Analyze", "History", "Results"]
 
 
+def _get_secret(name: str, default: str = "") -> str:
+    try:
+        if name in st.secrets:
+            return str(st.secrets.get(name, default))
+    except Exception:
+        pass
+    return str(os.getenv(name, default))
+
+
+@st.cache_resource
+def _get_supabase():
+    url = _get_secret("SUPABASE_URL")
+    key = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
 def init_db():
-    RES_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            folder_name TEXT NOT NULL,
-            analysis_name TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            points INTEGER NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+    pass
 
 
 def load_history():
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT folder_name, analysis_name, created_at, points FROM history ORDER BY id DESC"
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
+    sb = _get_supabase()
+    if sb is None:
+        return []
+
+    try:
+        resp = (
+            sb.table("history")
+            .select("folder_name,analysis_name,created_at,points")
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+        data = resp.data if hasattr(resp, "data") else []
+        if not isinstance(data, list):
+            return []
+        rows = []
+        for it in data:
+            rows.append(
+                {
+                    "folder_name": it.get("folder_name", ""),
+                    "analysis_name": it.get("analysis_name", ""),
+                    "created_at": str(it.get("created_at", "")),
+                    "points": int(it.get("points", 0) or 0),
+                }
+            )
+        return rows
+    except Exception:
+        return []
 
 
 def add_history(record: dict):
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO history (folder_name, analysis_name, created_at, points) VALUES (?, ?, ?, ?)",
-        (
-            str(record.get("folder_name", "")),
-            str(record.get("analysis_name", "")),
-            str(record.get("created_at", "")),
-            int(record.get("points", 0)),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    sb = _get_supabase()
+    if sb is None:
+        return
+
+    try:
+        created_at = record.get("created_at")
+        if not created_at:
+            created_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def _to_iso(s: str) -> str:
+            s = str(s).strip()
+            if "T" in s and s.endswith("Z"):
+                return s
+            try:
+                dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                try:
+                    dt = datetime.datetime.strptime(s, "%Y-%m-%d")
+                except Exception:
+                    dt = datetime.datetime.utcnow()
+            return dt.replace(microsecond=0).isoformat() + "Z"
+
+        payload = {
+            "folder_name": str(record.get("folder_name", "")),
+            "analysis_name": str(record.get("analysis_name", "")),
+            "created_at": _to_iso(created_at),
+            "points": int(record.get("points", 0) or 0),
+        }
+        sb.table("history").insert(payload).execute()
+    except Exception:
+        return
 
 
 def pick_video_file(folder: Path):
@@ -259,7 +300,7 @@ def topbar():
     c1, c2 = st.columns([0.70, 0.30], vertical_alignment="bottom")
 
     with c1:
-        render_logo_svg(width_px=72)
+        render_logo_svg(width_px=150)
 
     with c2:
         current_idx = PAGES.index(st.session_state["page"])
@@ -301,7 +342,7 @@ def about_page():
 
     with right:
         if MISSION_PATH.exists():
-            st.image(str(MISSION_PATH), use_container_width=True)
+            st.image(str(MISSION_PATH), width=420)
 
     st.divider()
 
@@ -318,7 +359,7 @@ def about_page():
         )
     with f3:
         st.markdown(
-            "<div class='soft'><div class='featT'>🗂️ Saved history</div><div class='featD'>Every launch is stored (SQLite). Re-open past runs and compare quickly.</div></div>",
+            "<div class='soft'><div class='featT'>🗂️ Saved history</div><div class='featD'>Every launch is stored (Supabase Postgres). Re-open past runs and compare quickly.</div></div>",
             unsafe_allow_html=True,
         )
 
@@ -328,6 +369,13 @@ def about_page():
         "<div class='muted'>Feedback welcome: <a href='mailto:palkiayp@gmail.com'><b>palkiayp@gmail.com</b></a></div>",
         unsafe_allow_html=True,
     )
+
+
+@st.cache_resource
+def get_model():
+    if not WEIGHTS_PATH.exists():
+        return None
+    return YOLO(str(WEIGHTS_PATH))
 
 
 def analysis_page():
@@ -369,7 +417,8 @@ def analysis_page():
     st.markdown("**Preview**")
     st.video(str(temp_video))
 
-    if not WEIGHTS_PATH.exists():
+    model = get_model()
+    if model is None:
         st.error(f"Model weights not found: {WEIGHTS_PATH.as_posix()}")
         return
 
@@ -378,7 +427,6 @@ def analysis_page():
 
     with st.spinner("Running model..."):
         try:
-            model = YOLO(str(WEIGHTS_PATH))
             results = model(
                 str(temp_video),
                 save=True,
@@ -452,6 +500,9 @@ def analysis_page():
 
 
 def history_page():
+    sb = _get_supabase()
+    if sb is None:
+        st.warning("History storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Secrets.")
     items = load_history()
 
     st.markdown("<div class='h1' style='font-size:1.95rem;'>History</div>", unsafe_allow_html=True)
@@ -524,7 +575,6 @@ def results_page():
 
 
 apply_ui()
-init_db()
 topbar()
 
 page = st.session_state.get("page", "About")
