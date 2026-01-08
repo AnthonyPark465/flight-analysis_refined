@@ -52,15 +52,20 @@ def _get_secret(name: str, default: str = "") -> str:
 
 
 @st.cache_resource
+def _make_supabase(url: str, key: str):
+    return create_client(url, key)
+
+
 def _get_supabase():
-    url = _get_secret("SUPABASE_URL")
-    key = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
+    url = _get_secret("SUPABASE_URL").strip()
+    key = _get_secret("SUPABASE_SERVICE_ROLE_KEY").strip()
     if not url or not key:
         return None
     try:
-        return create_client(url, key)
+        return _make_supabase(url, key)
     except Exception:
         return None
+
 
 
 def init_db():
