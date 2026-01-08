@@ -106,35 +106,40 @@ def load_history():
 def add_history(record: dict):
     sb = _get_supabase()
     if sb is None:
+        st.error("Supabase not configured.")
         return
 
     try:
         created_at = record.get("created_at")
         if not created_at:
-            created_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            created_at = datetime.datetime.utcnow()
 
-        def _to_iso(s: str) -> str:
-            s = str(s).strip()
-            if "T" in s and s.endswith("Z"):
-                return s
+        # ✅ Supabase timestamptz에는 ISO8601이 제일 안전
+        if isinstance(created_at, str):
+            # "YYYY-mm-dd HH:MM:SS" 들어오면 파싱
             try:
-                dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+                created_at = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
             except Exception:
-                try:
-                    dt = datetime.datetime.strptime(s, "%Y-%m-%d")
-                except Exception:
-                    dt = datetime.datetime.utcnow()
-            return dt.replace(microsecond=0).isoformat() + "Z"
+                created_at = datetime.datetime.utcnow()
+
+        created_at_iso = created_at.replace(microsecond=0).isoformat() + "Z"
 
         payload = {
             "folder_name": str(record.get("folder_name", "")),
             "analysis_name": str(record.get("analysis_name", "")),
-            "created_at": _to_iso(created_at),
+            "created_at": created_at_iso,
             "points": int(record.get("points", 0) or 0),
         }
-        sb.table("history").insert(payload).execute()
-    except Exception:
+
+        r = sb.table("history").insert(payload).execute()
+        # ✅ 성공 여부 확인용
+        st.toast("Saved to history ✅", icon="✅")
+        return r
+    except Exception as e:
+        st.error("History insert failed ❌")
+        st.exception(e)
         return
+
 
 
 def pick_video_file(folder: Path):
