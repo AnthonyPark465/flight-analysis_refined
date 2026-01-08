@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+res/
+*.mp4
+temp_upload.mp4
