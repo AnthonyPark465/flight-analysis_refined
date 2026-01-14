@@ -4,3 +4,6 @@ plotly==5.22.0
 numpy<2
 supabase==2.6.0
 rich==13.9.4
+watchdog
+matplotlib
+opencv-python-headless

@@ -2,46 +2,53 @@ import os
 import base64
 import datetime
 from pathlib import Path
+import shutil
 
 import streamlit as st
+# Vercel 등 클라우드 환경에서 에러 방지를 위해 matplotlib 백엔드 설정
+import matplotlib
+matplotlib.use('Agg')
+
 from ultralytics import YOLO
 import plotly.graph_objects as go
-
 from supabase import create_client
 
-
+# --- 기본 설정 ---
 BASE_DIR = Path(__file__).resolve().parent
 
-
+# 로컬 저장소 설정 (Vercel에서는 임시 폴더인 /tmp 사용 권장)
 def _pick_persist_dir() -> Path:
+    # Vercel 환경인지 확인
+    if os.environ.get("VERCEL"):
+        p = Path("/tmp/res")
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    
     candidates = []
     env_dir = os.getenv("PERSIST_DIR")
     if env_dir:
         candidates.append(Path(env_dir))
-    candidates.append(Path("/data"))
     candidates.append(BASE_DIR / "res")
-
+    
     for p in candidates:
         try:
             p.mkdir(parents=True, exist_ok=True)
-            test = p / ".write_test"
-            test.write_text("ok", encoding="utf-8")
-            test.unlink(missing_ok=True)
             return p
         except Exception:
             continue
     return BASE_DIR / "res"
 
-
 RES_DIR = _pick_persist_dir()
 
 LOGO_PATH = BASE_DIR / "flightdata-logo.svg"
 MISSION_PATH = BASE_DIR / "mission.png"
+# 모델 경로: 환경변수 혹은 기본 파일
 WEIGHTS_PATH = Path(os.getenv("MODEL_PATH", str(BASE_DIR / "250921_best.pt")))
 
-PAGES = ["About", "Analyze", "History", "Results"]
+# 페이지 정의 (Results 통합됨)
+PAGES = ["Home", "Analyze", "History"]
 
-
+# --- Supabase 헬퍼 ---
 def _get_secret(name: str, default: str = "") -> str:
     try:
         if name in st.secrets:
@@ -50,11 +57,9 @@ def _get_secret(name: str, default: str = "") -> str:
         pass
     return str(os.getenv(name, default))
 
-
 @st.cache_resource
 def _make_supabase(url: str, key: str):
     return create_client(url, key)
-
 
 def _get_supabase():
     url = _get_secret("SUPABASE_URL").strip()
@@ -66,17 +71,10 @@ def _get_supabase():
     except Exception:
         return None
 
-
-
-def init_db():
-    pass
-
-
 def load_history():
     sb = _get_supabase()
     if sb is None:
         return []
-
     try:
         resp = (
             sb.table("history")
@@ -90,85 +88,64 @@ def load_history():
             return []
         rows = []
         for it in data:
-            rows.append(
-                {
-                    "folder_name": it.get("folder_name", ""),
-                    "analysis_name": it.get("analysis_name", ""),
-                    "created_at": str(it.get("created_at", "")),
-                    "points": int(it.get("points", 0) or 0),
-                }
-            )
+            # 포인트가 없거나 데이터가 불완전한 행은 스킵 (빈 리스트 제거 요청 반영)
+            if not it.get("analysis_name") or not it.get("points"):
+                continue
+            
+            rows.append({
+                "folder_name": it.get("folder_name", ""),
+                "analysis_name": it.get("analysis_name", ""),
+                "created_at": str(it.get("created_at", "")),
+                "points": int(it.get("points", 0) or 0),
+            })
         return rows
     except Exception:
         return []
 
-
 def add_history(record: dict):
     sb = _get_supabase()
     if sb is None:
-        st.error("Supabase not configured.")
+        st.toast("Supabase not configured (History skipped)", icon="⚠️")
         return
-
     try:
         created_at = record.get("created_at")
         if not created_at:
             created_at = datetime.datetime.utcnow()
-
-        # ✅ Supabase timestamptz에는 ISO8601이 제일 안전
         if isinstance(created_at, str):
-            # "YYYY-mm-dd HH:MM:SS" 들어오면 파싱
             try:
                 created_at = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
             except Exception:
                 created_at = datetime.datetime.utcnow()
-
+        
         created_at_iso = created_at.replace(microsecond=0).isoformat() + "Z"
-
         payload = {
             "folder_name": str(record.get("folder_name", "")),
             "analysis_name": str(record.get("analysis_name", "")),
             "created_at": created_at_iso,
             "points": int(record.get("points", 0) or 0),
         }
-
-        r = sb.table("history").insert(payload).execute()
-        # ✅ 성공 여부 확인용
+        sb.table("history").insert(payload).execute()
         st.toast("Saved to history ✅", icon="✅")
-        return r
     except Exception as e:
-        st.error("History insert failed ❌")
-        st.exception(e)
-        return
+        print(f"History insert failed: {e}")
 
-
-
+# --- 유틸리티 ---
 def pick_video_file(folder: Path):
     if not folder.exists():
         return None
     mp4s = sorted(folder.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not mp4s:
         return None
-    non_input = [
-        p
-        for p in mp4s
-        if p.name.lower()
-        not in ("input.mp4", "original.mp4", "temp_upload.mp4")
-    ]
+    non_input = [p for p in mp4s if p.name.lower() not in ("input.mp4", "original.mp4")]
     return non_input[0] if non_input else mp4s[0]
 
-
-def render_saved_plot(folder: Path):
+def load_saved_plot_html(folder: Path):
     html_path = folder / "trajectory_plot.html"
     if html_path.exists():
-        st.components.v1.html(
-            html_path.read_text(encoding="utf-8"),
-            height=720,
-            scrolling=True,
-        )
-        return True
-    return False
+        return html_path.read_text(encoding="utf-8")
+    return None
 
-
+# --- UI 스타일링 ---
 def apply_ui():
     st.set_page_config(
         page_title="Flight Analysis",
@@ -176,123 +153,90 @@ def apply_ui():
         layout="wide",
         initial_sidebar_state="collapsed",
     )
-
-    st.markdown(
-        """
+    
+    st.markdown("""
         <style>
+        /* 기본 헤더 숨김 */
         [data-testid="stHeader"] { display: none !important; }
-        #MainMenu { visibility: hidden; }
-        footer { visibility: hidden; }
-        section[data-testid="stSidebar"] { display: none; }
-
+        
+        /* 폰트 설정 */
         html, body, [class*="css"] {
-            font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans";
+            font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         }
-
         .block-container {
-            padding-top: 0.10rem;
-            padding-bottom: 2.0rem;
-            max-width: 1180px;
+            padding-top: 1rem;
+            padding-bottom: 3rem;
+            max-width: 1200px;
+        }
+        
+        /* --- 네비게이션(Radio) 스타일링 --- */
+        
+        /* 1. 라디오 그룹 컨테이너 */
+        div[data-testid="stRadio"] > div[role="radiogroup"] {
+            display: flex;
+            justify-content: flex-end;
+            gap: 24px;
+            border-bottom: 1px solid #e2e8f0;
+            padding-bottom: 10px;
+            background: transparent;
         }
 
-        div[data-testid="stVerticalBlockBorderWrapper"],
-        div[data-testid="stBlockBorderWrapper"]{
-            border: none !important;
-            box-shadow: none !important;
-            background: transparent !important;
+        /* 2. 동그란 라디오 버튼(원) 숨기기 */
+        div[data-testid="stRadio"] label > div:first-child {
+            display: none !important;
         }
 
-        div[data-testid="stImage"] { margin-bottom: 0 !important; }
+        /* 3. 텍스트(p태그) 스타일 - 여기가 핵심입니다 */
+        /* label 바로 아래가 아니라, 내부 텍스트 요소(p)를 직접 타겟팅합니다 */
+        div[data-testid="stRadio"] label p {
+            font-size: 1rem !important;
+            font-weight: 500 !important;
+            color: #94a3b8 !important; /* 기본: 연한 회색 */
+            
+            /* 여기에 transition을 걸어야 글자 색이 부드럽게 바뀝니다 */
+            transition: color 0.25s ease-in-out !important; 
+        }
 
-        .topbar-divider{
+        /* 4. 마우스 호버 효과 */
+        div[data-testid="stRadio"] label:hover p {
+            color: #334155 !important; /* 마우스 올리면: 중간 회색 */
+        }
+
+        /* 5. 선택된 항목 스타일 (Active) */
+        div[data-testid="stRadio"] label:has(input:checked) p {
+            color: #0f172a !important; /* 선택됨: 진한 검정 */
+            font-weight: 700 !important;
+        }
+
+        /* 기타 스타일 */
+        button[title="View fullscreen"] { display: none !important; }
+        [data-testid="stImage"] button { display: none !important; }
+        [data-testid="stFileUploader"] { margin-top: 0px; }
+        .topbar-divider {
             height: 1px;
-            background: rgba(15,23,42,0.10);
-            margin: 2px 0 14px 0;
+            background: #e2e8f0;
+            margin: 0 0 24px 0;
         }
-
-        div[data-testid="stRadio"] div[role="radiogroup"]{
-            flex-direction: row !important;
-            justify-content: flex-end !important;
-            align-items: flex-end !important;
-            gap: 14px !important;
-            border-bottom: 1px solid rgba(15,23,42,0.10) !important;
-            padding-bottom: 2px !important;
-            margin: 0 !important;
+        .big-label {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: #1e293b;
+            margin-bottom: 0.2rem;
         }
-
-        div[data-testid="stRadio"] label{
-            margin: 0 !important;
-            padding: 6px 2px 10px 2px !important;
-            background: transparent !important;
-            border: none !important;
-            border-bottom: 2px solid transparent !important;
-            cursor: pointer !important;
-        }
-
-        div[data-testid="stRadio"] label > div:first-child{
-            display:none !important;
-        }
-
-        div[data-testid="stRadio"] label *{
-            color: rgba(15,23,42,0.62) !important;
-            font-weight: 760 !important;
-            font-size: 0.98rem !important;
-            line-height: 1 !important;
-        }
-
-        div[data-testid="stRadio"] label:hover *{
-            color: rgba(15,23,42,0.92) !important;
-        }
-
-        div[data-testid="stRadio"] label:has(input:checked){
-            border-bottom-color: #fd8c73 !important;
-        }
-        div[data-testid="stRadio"] label:has(input:checked) *{
-            color: rgba(15,23,42,0.92) !important;
-        }
-
-        div[data-testid="stRadio"] input:checked ~ div *{
-            color: rgba(15,23,42,0.92) !important;
-        }
-
-        .h1 { font-size: 2.5rem; font-weight: 900; letter-spacing: -0.05em; margin: 0 0 12px 0; line-height: 1.04; color:#0f172a; }
-        .sub { color: rgba(15,23,42,0.62); font-size: 1.06rem; margin: 0 0 16px 0; }
-
-        .chips { display:flex; flex-wrap:wrap; gap:10px; margin-top: 12px; }
-        .chip {
-            display:inline-flex;
-            align-items:center;
-            gap: 8px;
-            padding: 8px 12px;
-            border-radius: 999px;
-            border: 1px solid rgba(15,23,42,0.10);
-            background: rgba(15,23,42,0.02);
-            font-size: 0.92rem;
-            color: rgba(15,23,42,0.78);
-        }
-
-        .soft {
-            background: rgba(15,23,42,0.02);
-            border: 1px solid rgba(15,23,42,0.06);
-            border-radius: 16px;
-            padding: 14px 14px;
-        }
-        .featT { font-weight: 840; letter-spacing: -0.01em; color:#0f172a; margin-bottom: 6px; }
-        .featD { color: rgba(15,23,42,0.62); font-size: 0.96rem; line-height: 1.55; }
-        .muted { color: rgba(15,23,42,0.62); }
-
-        .stTextInput input { border-radius: 14px !important; }
-        div[data-testid="stFileUploader"] section { border-radius: 16px !important; }
         </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    """, unsafe_allow_html=True)
 
-
-def render_logo_svg(width_px: int = 72):
+def render_logo_svg(width_px: int = 120):
+    # 로고 파일이 없으면 텍스트만 표시
     if not LOGO_PATH.exists():
+        st.markdown("### FlightData")
         return
+
+    # 이미지를 Base64로 변환
     b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
+    
+    # [수정됨] 버튼 해킹(hidden button) 코드를 제거하고 순수 이미지만 출력합니다.
+    # 클릭 시 이동 기능은 우측 네비게이션 메뉴를 사용하세요.
     st.markdown(
         f"""
         <div style="display:flex; align-items:center;">
@@ -302,297 +246,316 @@ def render_logo_svg(width_px: int = 72):
         unsafe_allow_html=True,
     )
 
-
 def topbar():
-    if "page" not in st.session_state or st.session_state["page"] not in PAGES:
-        st.session_state["page"] = "About"
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Home"
+    
+    # URL 쿼리 파라미터나 세션 상태 안전장치
+    if st.session_state["page"] not in PAGES:
+        st.session_state["page"] = "Home"
 
-    c1, c2 = st.columns([0.70, 0.30], vertical_alignment="bottom")
+    c1, c2 = st.columns([0.2, 0.8], vertical_alignment="bottom")
 
     with c1:
-        render_logo_svg(width_px=150)
+        # 로고 표시
+        render_logo_svg(width_px=140)
 
     with c2:
-        current_idx = PAGES.index(st.session_state["page"])
-        st.radio(
-            "nav",
-            PAGES,
-            index=current_idx,
+        current_page = st.session_state["page"]
+        
+        # 화면에 보여줄 텍스트 (스크린샷처럼 About으로 변경)
+        # PAGES = ["Home", "Analyze", "History"] 라고 가정
+        display_map = {
+            "Home": "About",
+            "Analyze": "Analyze",
+            "History": "History"
+        }
+        
+        # 현재 페이지의 인덱스 찾기
+        try:
+            idx = PAGES.index(current_page)
+        except ValueError:
+            idx = 0
+            
+        # 선택용 리스트 생성 (About, Analyze, History)
+        display_options = [display_map[p] for p in PAGES]
+
+        selected_display = st.radio(
+            "nav_radio",
+            display_options,
+            index=idx,
             horizontal=True,
-            key="page",
             label_visibility="collapsed",
+            key="nav_radio_key"
         )
+        
+        # 선택된 라벨("About")을 다시 내부 페이지명("Home")으로 변환
+        reverse_map = {v: k for k, v in display_map.items()}
+        selected_page = reverse_map[selected_display]
 
-    st.markdown("<div class='topbar-divider'></div>", unsafe_allow_html=True)
+        if selected_page != current_page:
+            st.session_state["page"] = selected_page
+            st.rerun()
 
+    # 구분선 (이미 스타일에서 border-bottom을 줬으므로 여기서는 여백만 조정하거나 제거 가능)
+    # st.markdown("<div class='topbar-divider'></div>", unsafe_allow_html=True)
 
-def about_page():
-    left, right = st.columns([1.25, 0.75], gap="large", vertical_alignment="center")
+# --- Pages ---
+
+def home_page():
+    # 아이콘 변경 요청: AI 느낌 제거 -> 직관적인 이모지 사용
+    
+    left, right = st.columns([1.2, 0.8], gap="large", vertical_alignment="center")
 
     with left:
-        st.markdown("<div class='h1'>Flight Analysis</div>", unsafe_allow_html=True)
-        st.markdown(
-            "<div class='sub'>Upload a launch video and turn it into clean trajectory + performance signals, instantly.</div>",
-            unsafe_allow_html=True,
-        )
+        st.title("Flight Analysis")
         st.markdown(
             """
-            <div class="chips">
-              <span class="chip">📈 Trajectory</span>
-              <span class="chip">📏 Distance estimate</span>
-              <span class="chip">🧭 Angle &amp; speed intuition</span>
+            <div style='color:#64748b; font-size:1.1rem; margin-bottom:20px;'>
+            Upload a launch video and turn it into clean trajectory + performance signals, instantly.
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+        
+        # 태그들
+        st.markdown(
+            """
+            <div style="display:flex; gap:10px; margin-bottom:20px;">
+              <span style="background:#f1f5f9; padding:6px 12px; border-radius:20px; font-size:0.9rem; color:#334155;">📈 Trajectory</span>
+              <span style="background:#f1f5f9; padding:6px 12px; border-radius:20px; font-size:0.9rem; color:#334155;">📏 Distance</span>
+              <span style="background:#f1f5f9; padding:6px 12px; border-radius:20px; font-size:0.9rem; color:#334155;">🧭 Angle & Speed</span>
             </div>
             """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            "<div style='margin-top:14px;' class='muted'>No telemetry needed. Built for students, hobbyists, and quick experiments.</div>",
-            unsafe_allow_html=True,
+            unsafe_allow_html=True
         )
 
     with right:
         if MISSION_PATH.exists():
-            st.image(str(MISSION_PATH), width=420)
+            st.image(str(MISSION_PATH), use_column_width=True)
 
     st.divider()
 
-    f1, f2, f3 = st.columns(3, gap="large")
-    with f1:
-        st.markdown(
-            "<div class='soft'><div class='featT'>⚡ Fast workflow</div><div class='featD'>Drop a video, name the run, and generate a trajectory in one flow.</div></div>",
-            unsafe_allow_html=True,
-        )
-    with f2:
-        st.markdown(
-            "<div class='soft'><div class='featT'>🧠 Motion extraction</div><div class='featD'>Detection-based tracking to collect points and visualize the path.</div></div>",
-            unsafe_allow_html=True,
-        )
-    with f3:
-        st.markdown(
-            "<div class='soft'><div class='featT'>🗂️ Saved history</div><div class='featD'>Every launch is stored (Supabase Postgres). Re-open past runs and compare quickly.</div></div>",
-            unsafe_allow_html=True,
-        )
+    # 아이콘/텍스트 변경
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1:
+        st.subheader("Quick Start")
+        st.caption("Drop a video, name the run, and generate a trajectory in one flow.")
+    with c2:
+        st.subheader("Precise Tracking") 
+        st.caption("Detection-based tracking to collect points and visualize the path accurately.")
+    with c3:
+        st.subheader("Auto-Save") 
+        st.caption("Every launch is stored securely. Re-open past runs and compare quickly.")
 
     st.divider()
-    st.markdown("<div class='featT'>Get in touch</div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='muted'>Feedback welcome: <a href='mailto:palkiayp@gmail.com'><b>palkiayp@gmail.com</b></a></div>",
-        unsafe_allow_html=True,
-    )
-
+    st.markdown("Feedback welcome: **palkiayp@gmail.com**")
 
 @st.cache_resource
 def get_model():
+    # 모델 파일 없으면 에러 방지
     if not WEIGHTS_PATH.exists():
         return None
     return YOLO(str(WEIGHTS_PATH))
 
-
-def analysis_page():
+def analyze_page():
+    st.title("Analyze")
+    
+    # 텍스트 축약 및 정리
     st.markdown(
-        "<div class='h1' style='font-size:1.95rem;'>Analyze</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "<div class='sub'>Upload a .mp4 or .mov, name this run, then generate trajectory.</div>",
-        unsafe_allow_html=True,
+        """
+        <div style="background:#f8fafc; padding:15px; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:25px; color:#475569;">
+        Please upload an MP4 or MOV file, enter a name, and press the Start button to begin analysis.
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    c1, c2 = st.columns([1.1, 0.9], gap="large")
+    c1, c2 = st.columns([1, 1], gap="large")
+    
     with c1:
-        uploaded_file = st.file_uploader("Video file", type=["mp4", "mov"], key="upload_video")
+        st.markdown('<div class="big-label">1. Video file</div>', unsafe_allow_html=True)
+        uploaded_file = st.file_uploader("Upload video", type=["mp4", "mov"], label_visibility="collapsed")
+
     with c2:
-        analysis_name = st.text_input(
-            "Analysis name",
-            placeholder="e.g., cardboard_plane_test_01",
-            key="analysis_name",
-        )
+        st.markdown('<div class="big-label">2. Analysis name</div>', unsafe_allow_html=True)
+        analysis_name = st.text_input("Name", placeholder="e.g. Test_Flight_01", label_visibility="collapsed")
+        
+        st.write("") # Spacer
+        # Start 버튼 추가
+        start_btn = st.button("Start Analysis", type="primary", use_container_width=True)
 
-    if not (uploaded_file and analysis_name):
-        st.info("Upload a video and enter a name to start.")
-        return
-
-    RES_DIR.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = "".join(c for c in analysis_name if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
-    folder_name = f"{timestamp}_{safe_name}" if safe_name else f"{timestamp}_analysis"
-    output_folder = RES_DIR / folder_name
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    temp_video = output_folder / "input.mp4"
-    temp_video.write_bytes(uploaded_file.read())
-
-    st.divider()
-    st.markdown("**Preview**")
-    st.video(str(temp_video))
-
-    model = get_model()
-    if model is None:
-        st.error(f"Model weights not found: {WEIGHTS_PATH.as_posix()}")
-        return
-
-    st.divider()
-    st.markdown("**Run detection**")
-
-    with st.spinner("Running model..."):
-        try:
-            results = model(
-                str(temp_video),
-                save=True,
-                show=False,
-                project=str(RES_DIR),
-                name=folder_name,
-            )
-        except Exception as e:
-            st.error("Inference failed.")
-            st.exception(e)
+    # 로직: Start 버튼을 눌러야 실행
+    if start_btn:
+        if not uploaded_file:
+            st.warning("Please upload a video file first.")
+            return
+        if not analysis_name:
+            st.warning("Please enter an analysis name.")
             return
 
-    video_to_show = pick_video_file(output_folder)
-    st.success(f"Saved: {folder_name}")
-    if video_to_show:
-        st.video(str(video_to_show))
+        RES_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # 파일 저장 및 폴더 생성
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = "".join(c for c in analysis_name if c.isalnum() or c in ("-", "_")).strip()
+        folder_name = f"{timestamp}_{safe_name}" if safe_name else f"{timestamp}_analysis"
+        output_folder = RES_DIR / folder_name
+        output_folder.mkdir(parents=True, exist_ok=True)
 
-    trajectory_points = []
-    for frame_result in results:
-        if frame_result.boxes is None:
-            continue
-        boxes = frame_result.boxes.xyxy
-        if boxes is None:
-            continue
-        arr = boxes.cpu().numpy()
-        for box in arr:
-            x1, y1, x2, y2 = box[:4]
-            trajectory_points.append(((x1 + x2) / 2, (y1 + y2) / 2))
+        temp_video = output_folder / "input.mp4"
+        temp_video.write_bytes(uploaded_file.read())
 
-    st.divider()
-    st.markdown("**Trajectory**")
+        st.info(f"Processing '{analysis_name}'... Please wait.")
+        
+        model = get_model()
+        if model is None:
+            st.error(f"Model weights not found at {WEIGHTS_PATH}. Please check configuration.")
+            return
 
-    if len(trajectory_points) < 2:
-        st.info("Not enough detections to draw a trajectory.")
-        add_history(
-            {
-                "folder_name": folder_name,
-                "analysis_name": analysis_name,
-                "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "points": len(trajectory_points),
-            }
-        )
-        return
+        with st.spinner("Running detection & tracking..."):
+            try:
+                # YOLO Inference
+                results = model(
+                    str(temp_video),
+                    save=True,
+                    show=False,
+                    project=str(RES_DIR),
+                    name=folder_name,
+                    exist_ok=True # 폴더 이미 생성했으므로
+                )
+            except Exception as e:
+                st.error(f"Analysis failed: {e}")
+                return
 
-    xs, ys = zip(*trajectory_points)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="Object"))
-    fig.update_yaxes(autorange="reversed")
-    fig.update_layout(
-        margin=dict(l=20, r=20, t=50, b=20),
-        title="Trajectory",
-        xaxis_title="X (pixels)",
-        yaxis_title="Y (pixels)",
-        height=560,
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        # 결과 비디오 찾기
+        # Ultralytics는 project/name 폴더 안에 결과를 저장함. 
+        # 위에서 output_folder를 미리 만들었지만, model.predict가 내부에 또 생성할 수 있으므로 경로 확인 필요
+        # 보통 project/name/input.mp4 (avi) 등으로 저장됨.
+        
+        # 궤적 추출
+        trajectory_points = []
+        for frame_result in results:
+            if frame_result.boxes is None:
+                continue
+            boxes = frame_result.boxes.xyxy
+            if boxes is None:
+                continue
+            arr = boxes.cpu().numpy()
+            for box in arr:
+                x1, y1, x2, y2 = box[:4]
+                trajectory_points.append(((x1 + x2) / 2, (y1 + y2) / 2))
 
-    try:
-        fig.write_html(str(output_folder / "trajectory_plot.html"))
-    except Exception:
-        pass
-
-    add_history(
-        {
+        # 데이터 저장
+        pt_count = len(trajectory_points)
+        add_history({
             "folder_name": folder_name,
             "analysis_name": analysis_name,
-            "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "points": len(trajectory_points),
-        }
-    )
+            "created_at": datetime.datetime.now(),
+            "points": pt_count,
+        })
+        
+        # 그래프 생성
+        if pt_count > 1:
+            xs, ys = zip(*trajectory_points)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="Path", 
+                                     line=dict(color='#0f172a', width=2),
+                                     marker=dict(size=4)))
+            fig.update_yaxes(autorange="reversed")
+            
+            # 그래프 여백 및 ModeBar 제거, 레이블 겹침 방지
+            fig.update_layout(
+                margin=dict(l=60, r=20, t=40, b=40),
+                title="Trajectory",
+                xaxis_title="X (px)",
+                yaxis_title="Y (px)",
+                height=500,
+                hovermode="closest",
+                dragmode=False # 줌/팬 비활성화 (요청사항: 메뉴 삭제 효과)
+            )
+            
+            html_path = output_folder / "trajectory_plot.html"
+            fig.write_html(str(html_path), config={'displayModeBar': False})
+            
+        st.success("Analysis Complete! Go to History menu to view details if not shown below.")
+        
+        # 바로 결과 보여주기 (세션 상태를 이용해 리로드 없이 보여주거나, History 페이지로 유도)
+        st.session_state["page"] = "History"
+        st.rerun()
 
 
 def history_page():
-    sb = _get_supabase()
-    if sb is None:
-        st.warning("History storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Secrets.")
+    # History & Result 통합
+    st.title("History")
+    
     items = load_history()
-
-    st.markdown("<div class='h1' style='font-size:1.95rem;'>History</div>", unsafe_allow_html=True)
-    st.markdown("<div class='sub'>Your past launches are saved automatically after each analysis.</div>", unsafe_allow_html=True)
-
     if not items:
-        st.info("No history yet. Run an analysis first.")
+        st.info("No history found. Run an analysis first.")
         return
 
-    q = st.text_input("Search", placeholder="Type to filter…", key="history_search")
-    filtered = items
-    if q.strip():
-        qq = q.strip().lower()
-        filtered = [
-            it
-            for it in items
-            if qq in str(it.get("analysis_name", "")).lower()
-            or qq in str(it.get("folder_name", "")).lower()
-        ]
-
-    left, right = st.columns([0.42, 0.58], gap="large")
-
-    with left:
-        labels = [
-            f"{it.get('analysis_name','(no name)')} · {it.get('created_at','')} · pts:{it.get('points',0)}"
-            for it in filtered
-        ]
-        idx = st.selectbox(
-            "Select a launch",
-            list(range(len(labels))),
-            format_func=lambda i: labels[i],
-            key="history_pick",
-        )
-
-    chosen = filtered[idx]
-    folder = RES_DIR / chosen.get("folder_name", "")
-
-    with right:
-        st.markdown(f"**{chosen.get('analysis_name','(no name)')}**")
-        st.caption(f"{chosen.get('created_at','')} · folder: {chosen.get('folder_name','')}")
-        vid = pick_video_file(folder)
-        if vid:
-            st.video(str(vid))
-        if not render_saved_plot(folder):
-            st.info("No saved trajectory plot. Generate it from Analyze page first.")
-
-
-def results_page():
-    RES_DIR.mkdir(parents=True, exist_ok=True)
-
-    st.markdown("<div class='h1' style='font-size:1.95rem;'>Results</div>", unsafe_allow_html=True)
-    st.markdown("<div class='sub'>Browse result folders saved on disk.</div>", unsafe_allow_html=True)
-
-    subdirs = [d for d in RES_DIR.iterdir() if d.is_dir()]
-    if not subdirs:
-        st.info("No result folders yet.")
+    # 검색 및 필터
+    search_q = st.text_input("Search", placeholder="Type analysis name...", label_visibility="collapsed")
+    
+    filtered_items = items
+    if search_q:
+        q_lower = search_q.lower()
+        filtered_items = [it for it in items if q_lower in it["analysis_name"].lower()]
+    
+    if not filtered_items:
+        st.warning("No matching records.")
         return
 
-    subdirs_sorted = sorted(subdirs, key=lambda p: p.stat().st_mtime, reverse=True)
-    names = [p.name for p in subdirs_sorted]
+    # 드롭다운 라벨 생성
+    options = {
+        f"{it['analysis_name']} ({it['created_at'][:10]}) - {it['points']} pts": it 
+        for it in filtered_items
+    }
+    
+    selected_label = st.selectbox("Select a launch", list(options.keys()), label_visibility="collapsed")
+    selected_data = options[selected_label]
+    
+    folder_name = selected_data["folder_name"]
+    target_dir = RES_DIR / folder_name
+    
+    st.divider()
+    
+    # 결과 화면: 좌우 배치 (비율 조정으로 영상/그래프 작게)
+    c_vid, c_plot = st.columns([1, 1], gap="medium")
+    
+    with c_vid:
+        st.markdown("### Video")
+        vid_file = pick_video_file(target_dir)
+        
+        # Vercel 등에서는 파일시스템이 초기화되므로 파일이 없을 수 있음
+        if vid_file and vid_file.exists():
+            st.video(str(vid_file))
+        else:
+            st.error("Video file not found on server (Files are temporary on this demo).")
+            st.caption(f"Looking in: {target_dir}")
 
-    selected = st.selectbox("Select a folder", names, key="results_pick")
-    selected_dir = RES_DIR / selected
+    with c_plot:
+        st.markdown("### Trajectory")
+        html_content = load_saved_plot_html(target_dir)
+        
+        if html_content:
+            st.components.v1.html(html_content, height=520, scrolling=False)
+        else:
+            # 파일이 없으면 포인트 데이터라도 있으면 다시 그릴 수 있으나, 
+            # 현재 구조상 파일시스템 의존적이므로 메시지 출력
+            st.warning("Trajectory plot not found.")
 
-    vid = pick_video_file(selected_dir)
-    if vid:
-        st.video(str(vid))
-    if not render_saved_plot(selected_dir):
-        st.info("No saved trajectory plot in this folder.")
+    # Vercel 환경 안내
+    if os.environ.get("VERCEL"):
+        st.info("Note: On Vercel (Serverless), analyzed files are deleted after the session ends. Only the database record persists.")
 
-
+# --- Main Execution ---
 apply_ui()
 topbar()
 
-page = st.session_state.get("page", "About")
-if page == "About":
-    about_page()
-elif page == "Analyze":
-    analysis_page()
-elif page == "History":
+if st.session_state["page"] == "Home":
+    home_page()
+elif st.session_state["page"] == "Analyze":
+    analyze_page()
+elif st.session_state["page"] == "History":
     history_page()
-else:
-    results_page()
