@@ -3,9 +3,10 @@ import base64
 import datetime
 from pathlib import Path
 import shutil
+import time
 
 import streamlit as st
-# Vercel 등 클라우드 환경에서 에러 방지를 위해 matplotlib 백엔드 설정
+# Vercel/Streamlit Cloud 등 클라우드 환경에서 에러 방지를 위해 matplotlib 백엔드 설정
 import matplotlib
 matplotlib.use('Agg')
 
@@ -16,14 +17,15 @@ from supabase import create_client
 # --- 기본 설정 ---
 BASE_DIR = Path(__file__).resolve().parent
 
-# 로컬 저장소 설정 (Vercel에서는 임시 폴더인 /tmp 사용 권장)
+# 로컬 저장소 설정 (분석 중 임시 파일 생성용)
 def _pick_persist_dir() -> Path:
-    # Vercel 환경인지 확인
+    # Vercel 환경
     if os.environ.get("VERCEL"):
         p = Path("/tmp/res")
         p.mkdir(parents=True, exist_ok=True)
         return p
     
+    # Streamlit Cloud 등 기타 환경
     candidates = []
     env_dir = os.getenv("PERSIST_DIR")
     if env_dir:
@@ -39,13 +41,12 @@ def _pick_persist_dir() -> Path:
     return BASE_DIR / "res"
 
 RES_DIR = _pick_persist_dir()
+BUCKET_NAME = "flight-results"  # 생성하신 버킷 이름
 
 LOGO_PATH = BASE_DIR / "flightdata-logo.svg"
 MISSION_PATH = BASE_DIR / "mission.png"
-# 모델 경로: 환경변수 혹은 기본 파일
 WEIGHTS_PATH = Path(os.getenv("MODEL_PATH", str(BASE_DIR / "250921_best.pt")))
 
-# 페이지 정의 (Results 통합됨)
 PAGES = ["Home", "Analyze", "History"]
 
 # --- Supabase 헬퍼 ---
@@ -71,6 +72,58 @@ def _get_supabase():
     except Exception:
         return None
 
+# [NEW] 파일 업로드 함수
+def upload_to_supabase(local_folder: Path, folder_name: str):
+    sb = _get_supabase()
+    if sb is None:
+        st.error("Supabase connection failed.")
+        return False
+    
+    try:
+        # 1. MP4 업로드
+        video_path = local_folder / "input.mp4"
+        if video_path.exists():
+            with open(video_path, "rb") as f:
+                sb.storage.from_(BUCKET_NAME).upload(
+                    path=f"{folder_name}/input.mp4",
+                    file=f,
+                    file_options={"content-type": "video/mp4", "x-upsert": "true"}
+                )
+
+        # 2. HTML 업로드
+        html_path = local_folder / "trajectory_plot.html"
+        if html_path.exists():
+            with open(html_path, "rb") as f:
+                sb.storage.from_(BUCKET_NAME).upload(
+                    path=f"{folder_name}/trajectory_plot.html",
+                    file=f,
+                    file_options={"content-type": "text/html", "x-upsert": "true"}
+                )
+        return True
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
+        return False
+
+# [NEW] 클라우드에서 결과 가져오기 함수
+def get_cloud_results(folder_name: str):
+    sb = _get_supabase()
+    if sb is None:
+        return None, None
+    
+    # Video는 Public URL을 바로 사용
+    video_url = sb.storage.from_(BUCKET_NAME).get_public_url(f"{folder_name}/input.mp4")
+    
+    # HTML은 내용을 다운로드해서 읽음 (iframe 이슈 방지 및 깔끔한 렌더링)
+    html_content = None
+    try:
+        data = sb.storage.from_(BUCKET_NAME).download(f"{folder_name}/trajectory_plot.html")
+        html_content = data.decode("utf-8")
+    except Exception:
+        html_content = None
+        
+    return video_url, html_content
+
+# DB 히스토리 관련 함수
 def load_history():
     sb = _get_supabase()
     if sb is None:
@@ -88,10 +141,8 @@ def load_history():
             return []
         rows = []
         for it in data:
-            # 포인트가 없거나 데이터가 불완전한 행은 스킵 (빈 리스트 제거 요청 반영)
-            if not it.get("analysis_name") or not it.get("points"):
+            if not it.get("analysis_name"):
                 continue
-            
             rows.append({
                 "folder_name": it.get("folder_name", ""),
                 "analysis_name": it.get("analysis_name", ""),
@@ -125,25 +176,37 @@ def add_history(record: dict):
             "points": int(record.get("points", 0) or 0),
         }
         sb.table("history").insert(payload).execute()
-        st.toast("Saved to history ✅", icon="✅")
+        st.toast("Saved to DB & Cloud", icon="")
     except Exception as e:
         print(f"History insert failed: {e}")
 
-# --- 유틸리티 ---
-def pick_video_file(folder: Path):
-    if not folder.exists():
-        return None
-    mp4s = sorted(folder.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not mp4s:
-        return None
-    non_input = [p for p in mp4s if p.name.lower() not in ("input.mp4", "original.mp4")]
-    return non_input[0] if non_input else mp4s[0]
+# --- UI 유틸리티 ---
+def show_analysis_results(video_source, html_content):
+    """
+    결과를 보여주는 공통 함수 (로컬 파일 경로 or URL 모두 처리 가능하도록 수정)
+    video_source: 파일 경로(Path) 또는 URL(str)
+    html_content: HTML 문자열
+    """
+    col_left, col_center, col_right = st.columns([0.15, 0.7, 0.15])
+    
+    with col_center:
+        st.divider()
+        st.markdown("### Video")
+        
+        # 입력값이 문자열(URL)인지 경로(Path)인지 확인하여 처리
+        if isinstance(video_source, (str, Path)):
+            st.video(str(video_source))
+        else:
+            st.warning("Video source unavailable.")
 
-def load_saved_plot_html(folder: Path):
-    html_path = folder / "trajectory_plot.html"
-    if html_path.exists():
-        return html_path.read_text(encoding="utf-8")
-    return None
+        st.markdown("### Trajectory")
+        if html_content:
+            st.components.v1.html(html_content, height=550, scrolling=False)
+        else:
+            st.info("No trajectory plot available.")
+            
+        st.divider()
+
 
 # --- UI 스타일링 ---
 def apply_ui():
@@ -156,10 +219,7 @@ def apply_ui():
     
     st.markdown("""
         <style>
-        /* 기본 헤더 숨김 */
         [data-testid="stHeader"] { display: none !important; }
-        
-        /* 폰트 설정 */
         html, body, [class*="css"] {
             font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         }
@@ -168,10 +228,10 @@ def apply_ui():
             padding-bottom: 3rem;
             max-width: 1200px;
         }
+        [data-testid="InputInstructions"] { display: none !important; }
+        [data-testid="stHeaderActionElements"] { display: none !important; }
+        .stMarkdown a.anchor-link { display: none !important; }
         
-        /* --- 네비게이션(Radio) 스타일링 --- */
-        
-        /* 1. 라디오 그룹 컨테이너 */
         div[data-testid="stRadio"] > div[role="radiogroup"] {
             display: flex;
             justify-content: flex-end;
@@ -180,43 +240,21 @@ def apply_ui():
             padding-bottom: 10px;
             background: transparent;
         }
-
-        /* 2. 동그란 라디오 버튼(원) 숨기기 */
-        div[data-testid="stRadio"] label > div:first-child {
-            display: none !important;
-        }
-
-        /* 3. 텍스트(p태그) 스타일 - 여기가 핵심입니다 */
-        /* label 바로 아래가 아니라, 내부 텍스트 요소(p)를 직접 타겟팅합니다 */
+        div[data-testid="stRadio"] label > div:first-child { display: none !important; }
         div[data-testid="stRadio"] label p {
             font-size: 1rem !important;
             font-weight: 500 !important;
-            color: #94a3b8 !important; /* 기본: 연한 회색 */
-            
-            /* 여기에 transition을 걸어야 글자 색이 부드럽게 바뀝니다 */
+            color: #94a3b8 !important;
             transition: color 0.25s ease-in-out !important; 
         }
-
-        /* 4. 마우스 호버 효과 */
-        div[data-testid="stRadio"] label:hover p {
-            color: #334155 !important; /* 마우스 올리면: 중간 회색 */
-        }
-
-        /* 5. 선택된 항목 스타일 (Active) */
+        div[data-testid="stRadio"] label:hover p { color: #334155 !important; }
         div[data-testid="stRadio"] label:has(input:checked) p {
-            color: #0f172a !important; /* 선택됨: 진한 검정 */
+            color: #0f172a !important;
             font-weight: 700 !important;
         }
-
-        /* 기타 스타일 */
         button[title="View fullscreen"] { display: none !important; }
         [data-testid="stImage"] button { display: none !important; }
         [data-testid="stFileUploader"] { margin-top: 0px; }
-        .topbar-divider {
-            height: 1px;
-            background: #e2e8f0;
-            margin: 0 0 24px 0;
-        }
         .big-label {
             font-size: 1.2rem;
             font-weight: 700;
@@ -227,116 +265,55 @@ def apply_ui():
     """, unsafe_allow_html=True)
 
 def render_logo_svg(width_px: int = 120):
-    # 로고 파일이 없으면 텍스트만 표시
     if not LOGO_PATH.exists():
         st.markdown("### FlightData")
         return
-
-    # 이미지를 Base64로 변환
     b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
-    
-    # [수정됨] 버튼 해킹(hidden button) 코드를 제거하고 순수 이미지만 출력합니다.
-    # 클릭 시 이동 기능은 우측 네비게이션 메뉴를 사용하세요.
     st.markdown(
-        f"""
-        <div style="display:flex; align-items:center;">
-          <img src="data:image/svg+xml;base64,{b64}" style="width:{width_px}px; height:auto;" />
-        </div>
-        """,
+        f"""<div style="display:flex; align-items:center;"><img src="data:image/svg+xml;base64,{b64}" style="width:{width_px}px; height:auto;" /></div>""",
         unsafe_allow_html=True,
     )
 
 def topbar():
     if "page" not in st.session_state:
         st.session_state["page"] = "Home"
-    
-    # URL 쿼리 파라미터나 세션 상태 안전장치
     if st.session_state["page"] not in PAGES:
         st.session_state["page"] = "Home"
 
     c1, c2 = st.columns([0.2, 0.8], vertical_alignment="bottom")
-
     with c1:
-        # 로고 표시
         render_logo_svg(width_px=140)
-
     with c2:
         current_page = st.session_state["page"]
-        
-        # 화면에 보여줄 텍스트 (스크린샷처럼 About으로 변경)
-        # PAGES = ["Home", "Analyze", "History"] 라고 가정
-        display_map = {
-            "Home": "About",
-            "Analyze": "Analyze",
-            "History": "History"
-        }
-        
-        # 현재 페이지의 인덱스 찾기
+        display_map = {"Home": "About", "Analyze": "Analyze", "History": "History"}
         try:
             idx = PAGES.index(current_page)
         except ValueError:
             idx = 0
-            
-        # 선택용 리스트 생성 (About, Analyze, History)
         display_options = [display_map[p] for p in PAGES]
-
-        selected_display = st.radio(
-            "nav_radio",
-            display_options,
-            index=idx,
-            horizontal=True,
-            label_visibility="collapsed",
-            key="nav_radio_key"
-        )
-        
-        # 선택된 라벨("About")을 다시 내부 페이지명("Home")으로 변환
+        selected_display = st.radio("nav_radio", display_options, index=idx, horizontal=True, label_visibility="collapsed", key="nav_radio_key")
         reverse_map = {v: k for k, v in display_map.items()}
         selected_page = reverse_map[selected_display]
-
         if selected_page != current_page:
             st.session_state["page"] = selected_page
             st.rerun()
 
-    # 구분선 (이미 스타일에서 border-bottom을 줬으므로 여기서는 여백만 조정하거나 제거 가능)
-    # st.markdown("<div class='topbar-divider'></div>", unsafe_allow_html=True)
-
 # --- Pages ---
 
 def home_page():
-    # 아이콘 변경 요청: AI 느낌 제거 -> 직관적인 이모지 사용
-    
     left, right = st.columns([1.2, 0.8], gap="large", vertical_alignment="center")
-
     with left:
         st.title("Flight Analysis")
-        st.markdown(
-            """
-            <div style='color:#64748b; font-size:1.1rem; margin-bottom:20px;'>
-            Upload a launch video and turn it into clean trajectory + performance signals, instantly.
-            </div>
-            """, 
-            unsafe_allow_html=True
-        )
-        
-        # 태그들
-        st.markdown(
-            """
-            <div style="display:flex; gap:10px; margin-bottom:20px;">
+        st.markdown("""<div style='color:#64748b; font-size:1.1rem; margin-bottom:20px;'>Upload a launch video and turn it into clean trajectory + performance signals, instantly.</div>""", unsafe_allow_html=True)
+        st.markdown("""<div style="display:flex; gap:10px; margin-bottom:20px;">
               <span style="background:#f1f5f9; padding:6px 12px; border-radius:20px; font-size:0.9rem; color:#334155;">📈 Trajectory</span>
               <span style="background:#f1f5f9; padding:6px 12px; border-radius:20px; font-size:0.9rem; color:#334155;">📏 Distance</span>
               <span style="background:#f1f5f9; padding:6px 12px; border-radius:20px; font-size:0.9rem; color:#334155;">🧭 Angle & Speed</span>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
+            </div>""", unsafe_allow_html=True)
     with right:
         if MISSION_PATH.exists():
             st.image(str(MISSION_PATH), use_column_width=True)
-
     st.divider()
-
-    # 아이콘/텍스트 변경
     c1, c2, c3 = st.columns(3, gap="medium")
     with c1:
         st.subheader("Quick Start")
@@ -345,47 +322,33 @@ def home_page():
         st.subheader("Precise Tracking") 
         st.caption("Detection-based tracking to collect points and visualize the path accurately.")
     with c3:
-        st.subheader("Auto-Save") 
-        st.caption("Every launch is stored securely. Re-open past runs and compare quickly.")
-
+        st.subheader("Cloud Storage") 
+        st.caption("Runs are automatically uploaded to Supabase so you never lose data.")
     st.divider()
     st.markdown("Feedback welcome: **palkiayp@gmail.com**")
 
 @st.cache_resource
 def get_model():
-    # 모델 파일 없으면 에러 방지
     if not WEIGHTS_PATH.exists():
         return None
     return YOLO(str(WEIGHTS_PATH))
 
 def analyze_page():
     st.title("Analyze")
-    
-    # 텍스트 축약 및 정리
-    st.markdown(
-        """
-        <div style="background:#f8fafc; padding:15px; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:25px; color:#475569;">
-        Please upload an MP4 or MOV file, enter a name, and press the Start button to begin analysis.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    st.markdown("""<div style="background:#f8fafc; padding:15px; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:25px; color:#475569;">Please upload an MP4 or MOV file, enter a name, and press the Start button.</div>""", unsafe_allow_html=True)
 
     c1, c2 = st.columns([1, 1], gap="large")
-    
     with c1:
         st.markdown('<div class="big-label">1. Video file</div>', unsafe_allow_html=True)
         uploaded_file = st.file_uploader("Upload video", type=["mp4", "mov"], label_visibility="collapsed")
-
     with c2:
         st.markdown('<div class="big-label">2. Analysis name</div>', unsafe_allow_html=True)
         analysis_name = st.text_input("Name", placeholder="e.g. Test_Flight_01", label_visibility="collapsed")
-        
-        st.write("") # Spacer
-        # Start 버튼 추가
+        st.write("") 
         start_btn = st.button("Start Analysis", type="primary", use_container_width=True)
 
-    # 로직: Start 버튼을 눌러야 실행
+    result_container = st.container()
+
     if start_btn:
         if not uploaded_file:
             st.warning("Please upload a video file first.")
@@ -394,9 +357,8 @@ def analyze_page():
             st.warning("Please enter an analysis name.")
             return
 
+        # 1. 로컬 임시 폴더 생성
         RES_DIR.mkdir(parents=True, exist_ok=True)
-        
-        # 파일 저장 및 폴더 생성
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = "".join(c for c in analysis_name if c.isalnum() or c in ("-", "_")).strip()
         folder_name = f"{timestamp}_{safe_name}" if safe_name else f"{timestamp}_analysis"
@@ -410,91 +372,72 @@ def analyze_page():
         
         model = get_model()
         if model is None:
-            st.error(f"Model weights not found at {WEIGHTS_PATH}. Please check configuration.")
+            st.error(f"Model weights not found at {WEIGHTS_PATH}.")
             return
 
         with st.spinner("Running detection & tracking..."):
             try:
-                # YOLO Inference
-                results = model(
-                    str(temp_video),
-                    save=True,
-                    show=False,
-                    project=str(RES_DIR),
-                    name=folder_name,
-                    exist_ok=True # 폴더 이미 생성했으므로
-                )
+                results = model(str(temp_video), save=True, show=False, project=str(RES_DIR), name=folder_name, exist_ok=True)
             except Exception as e:
                 st.error(f"Analysis failed: {e}")
                 return
 
-        # 결과 비디오 찾기
-        # Ultralytics는 project/name 폴더 안에 결과를 저장함. 
-        # 위에서 output_folder를 미리 만들었지만, model.predict가 내부에 또 생성할 수 있으므로 경로 확인 필요
-        # 보통 project/name/input.mp4 (avi) 등으로 저장됨.
-        
         # 궤적 추출
         trajectory_points = []
         for frame_result in results:
-            if frame_result.boxes is None:
-                continue
+            if frame_result.boxes is None: continue
             boxes = frame_result.boxes.xyxy
-            if boxes is None:
-                continue
+            if boxes is None: continue
             arr = boxes.cpu().numpy()
             for box in arr:
                 x1, y1, x2, y2 = box[:4]
                 trajectory_points.append(((x1 + x2) / 2, (y1 + y2) / 2))
 
-        # 데이터 저장
+        # 그래프 생성 및 저장
         pt_count = len(trajectory_points)
-        add_history({
-            "folder_name": folder_name,
-            "analysis_name": analysis_name,
-            "created_at": datetime.datetime.now(),
-            "points": pt_count,
-        })
-        
-        # 그래프 생성
+        html_content = None
         if pt_count > 1:
             xs, ys = zip(*trajectory_points)
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="Path", 
-                                     line=dict(color='#0f172a', width=2),
-                                     marker=dict(size=4)))
+            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="Path", line=dict(color='#0f172a', width=2), marker=dict(size=4)))
             fig.update_yaxes(autorange="reversed")
-            
-            # 그래프 여백 및 ModeBar 제거, 레이블 겹침 방지
             fig.update_layout(
-                margin=dict(l=60, r=20, t=40, b=40),
-                title="Trajectory",
-                xaxis_title="X (px)",
-                yaxis_title="Y (px)",
-                height=500,
-                hovermode="closest",
-                dragmode=False # 줌/팬 비활성화 (요청사항: 메뉴 삭제 효과)
+                margin=dict(l=60, r=20, t=40, b=40), title="Trajectory",
+                xaxis_title="X (px)", yaxis_title="Y (px)", height=500, hovermode="closest", dragmode=False 
             )
-            
             html_path = output_folder / "trajectory_plot.html"
             fig.write_html(str(html_path), config={'displayModeBar': False})
-            
-        st.success("Analysis Complete! Go to History menu to view details if not shown below.")
+            html_content = html_path.read_text(encoding="utf-8")
+
+        # 2. Supabase Storage로 업로드
+        with st.spinner("Uploading results to Cloud Storage..."):
+            upload_success = upload_to_supabase(output_folder, folder_name)
         
-        # 바로 결과 보여주기 (세션 상태를 이용해 리로드 없이 보여주거나, History 페이지로 유도)
-        st.session_state["page"] = "History"
-        st.rerun()
+        # 3. DB 기록 저장
+        if upload_success:
+            add_history({
+                "folder_name": folder_name,
+                "analysis_name": analysis_name,
+                "created_at": datetime.datetime.now(),
+                "points": pt_count,
+            })
+            st.success("Analysis & Upload Complete!")
+        else:
+            st.error("Analysis done, but Cloud Upload failed.")
+
+        # 4. 결과 보기 (방금 만든 로컬 파일 사용해서 즉시 표시)
+        with result_container:
+            show_analysis_results(str(temp_video), html_content)
 
 
 def history_page():
-    # History & Result 통합
     st.title("History")
     
     items = load_history()
     if not items:
-        st.info("No history found. Run an analysis first.")
+        st.info("No history found.")
         return
 
-    # 검색 및 필터
     search_q = st.text_input("Search", placeholder="Type analysis name...", label_visibility="collapsed")
     
     filtered_items = items
@@ -506,7 +449,6 @@ def history_page():
         st.warning("No matching records.")
         return
 
-    # 드롭다운 라벨 생성
     options = {
         f"{it['analysis_name']} ({it['created_at'][:10]}) - {it['points']} pts": it 
         for it in filtered_items
@@ -514,40 +456,16 @@ def history_page():
     
     selected_label = st.selectbox("Select a launch", list(options.keys()), label_visibility="collapsed")
     selected_data = options[selected_label]
-    
     folder_name = selected_data["folder_name"]
-    target_dir = RES_DIR / folder_name
     
-    st.divider()
+    # [수정됨] 로컬 파일 대신 Supabase Cloud에서 URL 및 HTML 데이터 가져오기
+    with st.spinner("Loading from Cloud..."):
+        vid_url, html_data = get_cloud_results(folder_name)
     
-    # 결과 화면: 좌우 배치 (비율 조정으로 영상/그래프 작게)
-    c_vid, c_plot = st.columns([1, 1], gap="medium")
-    
-    with c_vid:
-        st.markdown("### Video")
-        vid_file = pick_video_file(target_dir)
-        
-        # Vercel 등에서는 파일시스템이 초기화되므로 파일이 없을 수 있음
-        if vid_file and vid_file.exists():
-            st.video(str(vid_file))
-        else:
-            st.error("Video file not found on server (Files are temporary on this demo).")
-            st.caption(f"Looking in: {target_dir}")
-
-    with c_plot:
-        st.markdown("### Trajectory")
-        html_content = load_saved_plot_html(target_dir)
-        
-        if html_content:
-            st.components.v1.html(html_content, height=520, scrolling=False)
-        else:
-            # 파일이 없으면 포인트 데이터라도 있으면 다시 그릴 수 있으나, 
-            # 현재 구조상 파일시스템 의존적이므로 메시지 출력
-            st.warning("Trajectory plot not found.")
-
-    # Vercel 환경 안내
-    if os.environ.get("VERCEL"):
-        st.info("Note: On Vercel (Serverless), analyzed files are deleted after the session ends. Only the database record persists.")
+    if vid_url:
+        show_analysis_results(vid_url, html_data)
+    else:
+        st.error("Could not retrieve files from Cloud Storage.")
 
 # --- Main Execution ---
 apply_ui()
