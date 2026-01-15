@@ -256,7 +256,7 @@ def apply_ui():
         [data-testid="stImage"] button { display: none !important; }
         [data-testid="stFileUploader"] { margin-top: 0px; }
         .big-label {
-            font-size: 1.2rem;
+            font-size: 1.5rem;
             font-weight: 700;
             color: #1e293b;
             margin-bottom: 0.2rem;
@@ -339,10 +339,10 @@ def analyze_page():
 
     c1, c2 = st.columns([1, 1], gap="large")
     with c1:
-        st.markdown('<div class="big-label">1. Video file</div>', unsafe_allow_html=True)
+        st.markdown('<div class="big-label">Video file</div>', unsafe_allow_html=True)
         uploaded_file = st.file_uploader("Upload video", type=["mp4", "mov"], label_visibility="collapsed")
     with c2:
-        st.markdown('<div class="big-label">2. Analysis name</div>', unsafe_allow_html=True)
+        st.markdown('<div class="big-label">Analysis name</div>', unsafe_allow_html=True)
         analysis_name = st.text_input("Name", placeholder="e.g. Test_Flight_01", label_visibility="collapsed")
         st.write("") 
         start_btn = st.button("Start Analysis", type="primary", use_container_width=True)
