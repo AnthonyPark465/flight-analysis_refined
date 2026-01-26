@@ -1,31 +1,29 @@
 import os
 import base64
 import datetime
+import json
 from pathlib import Path
 import shutil
 import time
 
 import streamlit as st
-# Vercel/Streamlit Cloud 등 클라우드 환경에서 에러 방지를 위해 matplotlib 백엔드 설정
 import matplotlib
 matplotlib.use('Agg')
 
 from ultralytics import YOLO
 import plotly.graph_objects as go
-from supabase import create_client
 
-# --- 기본 설정 ---
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
+
 BASE_DIR = Path(__file__).resolve().parent
 
-# 로컬 저장소 설정 (분석 중 임시 파일 생성용)
 def _pick_persist_dir() -> Path:
-    # Vercel 환경
-    if os.environ.get("VERCEL"):
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("VERCEL"):
         p = Path("/tmp/res")
         p.mkdir(parents=True, exist_ok=True)
         return p
     
-    # Streamlit Cloud 등 기타 환경
     candidates = []
     env_dir = os.getenv("PERSIST_DIR")
     if env_dir:
@@ -41,7 +39,6 @@ def _pick_persist_dir() -> Path:
     return BASE_DIR / "res"
 
 RES_DIR = _pick_persist_dir()
-BUCKET_NAME = "flight-results"  # 생성하신 버킷 이름
 
 LOGO_PATH = BASE_DIR / "flightdata-logo.svg"
 MISSION_PATH = BASE_DIR / "mission.png"
@@ -49,151 +46,168 @@ WEIGHTS_PATH = Path(os.getenv("MODEL_PATH", str(BASE_DIR / "250921_best.pt")))
 
 PAGES = ["Home", "Analyze", "History"]
 
-# --- Supabase 헬퍼 ---
-def _get_secret(name: str, default: str = "") -> str:
-    try:
-        if name in st.secrets:
-            return str(st.secrets.get(name, default))
-    except Exception:
-        pass
-    return str(os.getenv(name, default))
-
 @st.cache_resource
-def _make_supabase(url: str, key: str):
-    return create_client(url, key)
-
-def _get_supabase():
-    url = _get_secret("SUPABASE_URL").strip()
-    key = _get_secret("SUPABASE_SERVICE_ROLE_KEY").strip()
-    if not url or not key:
-        return None
+def init_firebase():
     try:
-        return _make_supabase(url, key)
-    except Exception:
+        if firebase_admin._apps:
+            return firebase_admin.get_app()
+
+        cred_json = os.environ.get("FIREBASE_CREDENTIALS")
+        if not cred_json and "FIREBASE_CREDENTIALS" in st.secrets:
+            cred_json = st.secrets["FIREBASE_CREDENTIALS"]
+
+        if not cred_json:
+            st.error("Firebase credentials not found.")
+            return None
+
+        if isinstance(cred_json, str):
+            try:
+                cred_dict = json.loads(cred_json)
+            except json.JSONDecodeError:
+                st.error("Invalid JSON format in FIREBASE_CREDENTIALS.")
+                return None
+        else:
+            cred_dict = cred_json
+
+        bucket_name = os.environ.get("FIREBASE_BUCKET_NAME")
+        if not bucket_name and "FIREBASE_BUCKET_NAME" in st.secrets:
+            bucket_name = st.secrets["FIREBASE_BUCKET_NAME"]
+        
+        if not bucket_name:
+            bucket_name = f"{cred_dict.get('project_id')}.appspot.com"
+
+        cred = credentials.Certificate(cred_dict)
+        return firebase_admin.initialize_app(cred, {
+            'storageBucket': bucket_name
+        })
+    except Exception as e:
+        st.error(f"Failed to initialize Firebase: {e}")
         return None
 
-# [NEW] 파일 업로드 함수
-def upload_to_supabase(local_folder: Path, folder_name: str):
-    sb = _get_supabase()
-    if sb is None:
-        st.error("Supabase connection failed.")
+init_firebase()
+
+def get_firestore_db():
+    if not firebase_admin._apps:
+        if init_firebase() is None:
+            return None
+    return firestore.client()
+
+def get_storage_bucket():
+    if not firebase_admin._apps:
+        if init_firebase() is None:
+            return None
+    return storage.bucket()
+
+def upload_to_firebase(local_folder: Path, folder_name: str):
+    bucket = get_storage_bucket()
+    if bucket is None:
+        st.error("Firebase Storage connection failed.")
         return False
     
     try:
-        # 1. MP4 업로드
         video_path = local_folder / "input.mp4"
         if video_path.exists():
-            with open(video_path, "rb") as f:
-                sb.storage.from_(BUCKET_NAME).upload(
-                    path=f"{folder_name}/input.mp4",
-                    file=f,
-                    file_options={"content-type": "video/mp4", "x-upsert": "true"}
-                )
+            blob_vid = bucket.blob(f"{folder_name}/input.mp4")
+            blob_vid.upload_from_filename(str(video_path), content_type="video/mp4")
 
-        # 2. HTML 업로드
         html_path = local_folder / "trajectory_plot.html"
         if html_path.exists():
-            with open(html_path, "rb") as f:
-                sb.storage.from_(BUCKET_NAME).upload(
-                    path=f"{folder_name}/trajectory_plot.html",
-                    file=f,
-                    file_options={"content-type": "text/html", "x-upsert": "true"}
-                )
+            blob_html = bucket.blob(f"{folder_name}/trajectory_plot.html")
+            blob_html.upload_from_filename(str(html_path), content_type="text/html")
+            
         return True
     except Exception as e:
         st.error(f"Upload failed: {e}")
         return False
 
-# [NEW] 클라우드에서 결과 가져오기 함수
 def get_cloud_results(folder_name: str):
-    sb = _get_supabase()
-    if sb is None:
+    bucket = get_storage_bucket()
+    if bucket is None:
         return None, None
     
-    # Video는 Public URL을 바로 사용
-    video_url = sb.storage.from_(BUCKET_NAME).get_public_url(f"{folder_name}/input.mp4")
-    
-    # HTML은 내용을 다운로드해서 읽음 (iframe 이슈 방지 및 깔끔한 렌더링)
+    video_url = None
     html_content = None
+
     try:
-        data = sb.storage.from_(BUCKET_NAME).download(f"{folder_name}/trajectory_plot.html")
-        html_content = data.decode("utf-8")
-    except Exception:
-        html_content = None
+        blob_vid = bucket.blob(f"{folder_name}/input.mp4")
+        if blob_vid.exists():
+            video_url = blob_vid.generate_signed_url(expiration=datetime.timedelta(hours=1))
+
+        blob_html = bucket.blob(f"{folder_name}/trajectory_plot.html")
+        if blob_html.exists():
+            html_bytes = blob_html.download_as_bytes()
+            html_content = html_bytes.decode("utf-8")
+
+    except Exception as e:
+        st.warning(f"Error retrieving files: {e}")
         
     return video_url, html_content
 
-# DB 히스토리 관련 함수
 def load_history():
-    sb = _get_supabase()
-    if sb is None:
+    db = get_firestore_db()
+    if db is None:
         return []
     try:
-        resp = (
-            sb.table("history")
-            .select("folder_name,analysis_name,created_at,points")
-            .order("created_at", desc=True)
+        docs = (
+            db.collection("history")
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
             .limit(500)
-            .execute()
+            .stream()
         )
-        data = resp.data if hasattr(resp, "data") else []
-        if not isinstance(data, list):
-            return []
+        
         rows = []
-        for it in data:
-            if not it.get("analysis_name"):
+        for doc in docs:
+            data = doc.to_dict()
+            if not data.get("analysis_name"):
                 continue
+            
+            c_at = data.get("created_at")
+            if isinstance(c_at, datetime.datetime):
+                c_at_str = c_at.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                c_at_str = str(c_at)
+
             rows.append({
-                "folder_name": it.get("folder_name", ""),
-                "analysis_name": it.get("analysis_name", ""),
-                "created_at": str(it.get("created_at", "")),
-                "points": int(it.get("points", 0) or 0),
+                "folder_name": data.get("folder_name", ""),
+                "analysis_name": data.get("analysis_name", ""),
+                "created_at": c_at_str,
+                "points": int(data.get("points", 0) or 0),
             })
         return rows
-    except Exception:
+    except Exception as e:
+        st.error(f"Failed to load history: {e}")
         return []
 
 def add_history(record: dict):
-    sb = _get_supabase()
-    if sb is None:
-        st.toast("Supabase not configured (History skipped)", icon="⚠️")
+    db = get_firestore_db()
+    if db is None:
+        st.toast("Firebase DB not configured", icon="⚠️")
         return
     try:
         created_at = record.get("created_at")
         if not created_at:
             created_at = datetime.datetime.utcnow()
-        if isinstance(created_at, str):
-            try:
-                created_at = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                created_at = datetime.datetime.utcnow()
         
-        created_at_iso = created_at.replace(microsecond=0).isoformat() + "Z"
         payload = {
             "folder_name": str(record.get("folder_name", "")),
             "analysis_name": str(record.get("analysis_name", "")),
-            "created_at": created_at_iso,
+            "created_at": created_at, 
             "points": int(record.get("points", 0) or 0),
         }
-        sb.table("history").insert(payload).execute()
-        st.toast("Saved to DB & Cloud", icon="")
+        
+        db.collection("history").add(payload)
+        st.toast("Saved to Firestore & Storage", icon="☁️")
     except Exception as e:
         print(f"History insert failed: {e}")
+        st.error(f"History save error: {e}")
 
-# --- UI 유틸리티 ---
 def show_analysis_results(video_source, html_content):
-    """
-    결과를 보여주는 공통 함수 (로컬 파일 경로 or URL 모두 처리 가능하도록 수정)
-    video_source: 파일 경로(Path) 또는 URL(str)
-    html_content: HTML 문자열
-    """
     col_left, col_center, col_right = st.columns([0.15, 0.7, 0.15])
     
     with col_center:
         st.divider()
         st.markdown("### Video")
         
-        # 입력값이 문자열(URL)인지 경로(Path)인지 확인하여 처리
         if isinstance(video_source, (str, Path)):
             st.video(str(video_source))
         else:
@@ -207,8 +221,6 @@ def show_analysis_results(video_source, html_content):
             
         st.divider()
 
-
-# --- UI 스타일링 ---
 def apply_ui():
     st.set_page_config(
         page_title="Flight Analysis",
@@ -298,8 +310,6 @@ def topbar():
             st.session_state["page"] = selected_page
             st.rerun()
 
-# --- Pages ---
-
 def home_page():
     left, right = st.columns([1.2, 0.8], gap="large", vertical_alignment="center")
     with left:
@@ -323,7 +333,7 @@ def home_page():
         st.caption("Detection-based tracking to collect points and visualize the path accurately.")
     with c3:
         st.subheader("Cloud Storage") 
-        st.caption("Runs are automatically uploaded to Supabase so you never lose data.")
+        st.caption("Runs are automatically uploaded to Firebase so you never lose data.")
     st.divider()
     st.markdown("Feedback welcome: **palkiayp@gmail.com**")
 
@@ -357,7 +367,6 @@ def analyze_page():
             st.warning("Please enter an analysis name.")
             return
 
-        # 1. 로컬 임시 폴더 생성
         RES_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = "".join(c for c in analysis_name if c.isalnum() or c in ("-", "_")).strip()
@@ -382,7 +391,6 @@ def analyze_page():
                 st.error(f"Analysis failed: {e}")
                 return
 
-        # 궤적 추출
         trajectory_points = []
         for frame_result in results:
             if frame_result.boxes is None: continue
@@ -393,7 +401,6 @@ def analyze_page():
                 x1, y1, x2, y2 = box[:4]
                 trajectory_points.append(((x1 + x2) / 2, (y1 + y2) / 2))
 
-        # 그래프 생성 및 저장
         pt_count = len(trajectory_points)
         html_content = None
         if pt_count > 1:
@@ -409,11 +416,10 @@ def analyze_page():
             fig.write_html(str(html_path), config={'displayModeBar': False})
             html_content = html_path.read_text(encoding="utf-8")
 
-        # 2. Supabase Storage로 업로드
+        upload_success = False
         with st.spinner("Uploading results to Cloud Storage..."):
-            upload_success = upload_to_supabase(output_folder, folder_name)
+            upload_success = upload_to_firebase(output_folder, folder_name)
         
-        # 3. DB 기록 저장
         if upload_success:
             add_history({
                 "folder_name": folder_name,
@@ -423,9 +429,8 @@ def analyze_page():
             })
             st.success("Analysis & Upload Complete!")
         else:
-            st.error("Analysis done, but Cloud Upload failed.")
+            st.error("Analysis done, but Cloud Upload failed. Check Firebase config.")
 
-        # 4. 결과 보기 (방금 만든 로컬 파일 사용해서 즉시 표시)
         with result_container:
             show_analysis_results(str(temp_video), html_content)
 
@@ -435,7 +440,7 @@ def history_page():
     
     items = load_history()
     if not items:
-        st.info("No history found.")
+        st.info("No history found in Firestore.")
         return
 
     search_q = st.text_input("Search", placeholder="Type analysis name...", label_visibility="collapsed")
@@ -450,7 +455,7 @@ def history_page():
         return
 
     options = {
-        f"{it['analysis_name']} ({it['created_at'][:10]}) - {it['points']} pts": it 
+        f"{it['analysis_name']} ({it['created_at'][:19]}) - {it['points']} pts": it 
         for it in filtered_items
     }
     
@@ -458,7 +463,6 @@ def history_page():
     selected_data = options[selected_label]
     folder_name = selected_data["folder_name"]
     
-    # [수정됨] 로컬 파일 대신 Supabase Cloud에서 URL 및 HTML 데이터 가져오기
     with st.spinner("Loading from Cloud..."):
         vid_url, html_data = get_cloud_results(folder_name)
     
@@ -467,7 +471,6 @@ def history_page():
     else:
         st.error("Could not retrieve files from Cloud Storage.")
 
-# --- Main Execution ---
 apply_ui()
 topbar()
 
