@@ -16,6 +16,63 @@ import plotly.graph_objects as go
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 
+def apply_ui():
+    st.set_page_config(
+        page_title="Flight Analysis",
+        page_icon="✈️",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+    
+    st.markdown("""
+        <style>
+        [data-testid="stHeader"] { display: none !important; }
+        html, body, [class*="css"] {
+            font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 3rem;
+            max-width: 1200px;
+        }
+        [data-testid="InputInstructions"] { display: none !important; }
+        [data-testid="stHeaderActionElements"] { display: none !important; }
+        .stMarkdown a.anchor-link { display: none !important; }
+        
+        div[data-testid="stRadio"] > div[role="radiogroup"] {
+            display: flex;
+            justify-content: flex-end;
+            gap: 24px;
+            border-bottom: 1px solid #e2e8f0;
+            padding-bottom: 10px;
+            background: transparent;
+        }
+        div[data-testid="stRadio"] label > div:first-child { display: none !important; }
+        div[data-testid="stRadio"] label p {
+            font-size: 1rem !important;
+            font-weight: 500 !important;
+            color: #94a3b8 !important;
+            transition: color 0.25s ease-in-out !important; 
+        }
+        div[data-testid="stRadio"] label:hover p { color: #334155 !important; }
+        div[data-testid="stRadio"] label:has(input:checked) p {
+            color: #0f172a !important;
+            font-weight: 700 !important;
+        }
+        button[title="View fullscreen"] { display: none !important; }
+        [data-testid="stImage"] button { display: none !important; }
+        [data-testid="stFileUploader"] { margin-top: 0px; }
+        .big-label {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #1e293b;
+            margin-bottom: 0.2rem;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+apply_ui()
+
 BASE_DIR = Path(__file__).resolve().parent
 
 def _pick_persist_dir() -> Path:
@@ -221,61 +278,6 @@ def show_analysis_results(video_source, html_content):
             
         st.divider()
 
-def apply_ui():
-    st.set_page_config(
-        page_title="Flight Analysis",
-        page_icon="✈️",
-        layout="wide",
-        initial_sidebar_state="collapsed",
-    )
-    
-    st.markdown("""
-        <style>
-        [data-testid="stHeader"] { display: none !important; }
-        html, body, [class*="css"] {
-            font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-        }
-        .block-container {
-            padding-top: 1rem;
-            padding-bottom: 3rem;
-            max-width: 1200px;
-        }
-        [data-testid="InputInstructions"] { display: none !important; }
-        [data-testid="stHeaderActionElements"] { display: none !important; }
-        .stMarkdown a.anchor-link { display: none !important; }
-        
-        div[data-testid="stRadio"] > div[role="radiogroup"] {
-            display: flex;
-            justify-content: flex-end;
-            gap: 24px;
-            border-bottom: 1px solid #e2e8f0;
-            padding-bottom: 10px;
-            background: transparent;
-        }
-        div[data-testid="stRadio"] label > div:first-child { display: none !important; }
-        div[data-testid="stRadio"] label p {
-            font-size: 1rem !important;
-            font-weight: 500 !important;
-            color: #94a3b8 !important;
-            transition: color 0.25s ease-in-out !important; 
-        }
-        div[data-testid="stRadio"] label:hover p { color: #334155 !important; }
-        div[data-testid="stRadio"] label:has(input:checked) p {
-            color: #0f172a !important;
-            font-weight: 700 !important;
-        }
-        button[title="View fullscreen"] { display: none !important; }
-        [data-testid="stImage"] button { display: none !important; }
-        [data-testid="stFileUploader"] { margin-top: 0px; }
-        .big-label {
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: #1e293b;
-            margin-bottom: 0.2rem;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
 def render_logo_svg(width_px: int = 120):
     if not LOGO_PATH.exists():
         st.markdown("### FlightData")
@@ -471,7 +473,6 @@ def history_page():
     else:
         st.error("Could not retrieve files from Cloud Storage.")
 
-apply_ui()
 topbar()
 
 if st.session_state["page"] == "Home":
