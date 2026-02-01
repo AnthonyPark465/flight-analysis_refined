@@ -13,6 +13,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8501
-
-CMD ["bash", "-lc", "streamlit run app.py --server.address=0.0.0.0 --server.port=8501"]
+# Railway에서 부여하는 PORT 환경변수를 사용하도록 변경
+CMD sh -c "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0"

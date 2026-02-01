@@ -430,11 +430,47 @@ def analyze_page():
                 "points": pt_count,
             })
             st.success("Analysis & Upload Complete!")
+            
+            # Save results to session state for persistence
+            st.session_state["current_analysis"] = {
+                "video_path": str(temp_video),
+                "html_content": html_content,
+                "timestamp": datetime.datetime.now(),
+                "name": analysis_name
+            }
+            # Rerun to refresh the page and show results from state
+            st.rerun()
+            
         else:
             st.error("Analysis done, but Cloud Upload failed. Check Firebase config.")
+            # Even if upload failed, show local results if available
+            st.session_state["current_analysis"] = {
+                "video_path": str(temp_video),
+                "html_content": html_content,
+                "timestamp": datetime.datetime.now(),
+                "name": analysis_name
+            }
+            st.rerun()
 
-        with result_container:
-            show_analysis_results(str(temp_video), html_content)
+    # Display Persistent Results
+    if "current_analysis" in st.session_state and st.session_state["current_analysis"]:
+        ca = st.session_state["current_analysis"]
+        # Check if expired (24 hours)
+        elapsed = datetime.datetime.now() - ca["timestamp"]
+        if elapsed.total_seconds() < 86400: # 24 hours
+            with result_container:
+                st.markdown(f"### Recent Result: {ca['name']}")
+                st.caption(f"Analyzed at: {ca['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                show_analysis_results(ca["video_path"], ca["html_content"])
+                
+                if st.button("Clear Result", help="Clear this result from the view"):
+                    del st.session_state["current_analysis"]
+                    st.rerun()
+        else:
+            # Auto-clear expired result
+            del st.session_state["current_analysis"]
+            st.rerun()
 
 
 def history_page():
